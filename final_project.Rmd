@@ -1,0 +1,829 @@
+---
+title: "Group 9 - Predicting CCRB Dispositions: Analyzing Substantiated and Exonerated Allegations in NYPD Data (1985–2020)"
+output: 
+  html_document: 
+    coding_folding: hide
+    toc: true
+    toc_float: true
+    collapse: false
+    number_sections: false
+    sef_contained: true
+
+---
+
+# Instructions 
+
+You and your team of data scientists were hired by a company to gain insights on the dataset in your chosen prompt. 
+
+1. Perform any necessary data pre-processing and cleaning, and document your steps. Depending on the prompt you selected, this may involve transforming variables, creating new variables, and merging data frames. In particular, you may need to make some decisions on how to handle missing data, such as removing rows or columns with a significant amount of missing observations, creating an "unknown" category, or replacing/imputing the missing values. You do not need to develop a rigorous process or cite references, but please briefly justify your choices. 
+
+2. Make and interpret 4-10 visualizations to help you understand the relationships between the variables in your dataset. We highly encourage you to explore the data on your own, but when preparing your response to this question, please be parsimonious in your plots and select visualizations that help you tell a story about the data. If you need to make additional plots to support your responses to the other questions (e.g. to motivate data cleaning or modeling choices), that's fine. 
+
+3. Build any 2 machine learning models that use your choice of covariates to predict the given outcome variable. Explain why you chose those covariates and interpret the model performances. If you are including categorical variables as covariates in a `glmnet` model (lasso or ridge regression), please remember that you will need to convert your covariate data frame into a *model matrix*, e.g. by calling the `model.matrix` function:
+
+```r
+model_matrix = model.matrix(~.-1, my_covariate_df)
+```
+
+4. The company stakeholders want to know what decision they should make on their stated goal/question. Based on your analysis, make recommendations for a non-technical audience. 
+
+5. Any additional information that might be useful to collect/have? Other open-ended/non-coding question(s)? 
+
+
+### NYPD complaints
+
+The file `allegations_202007271729.csv` contains records about closed cases for every police officer on the NYPD force as of late June 2020 who had at least one substantiated allegation against them, spanning from September 1985 to January 2020. Information on the variables in this dataset can be found in `CCRB Data Layout Table.xlsx`. This data was downloaded from 
+[Kaggle](https://www.kaggle.com/datasets/mrmorj/civilian-complaints-against-nyc-police-officers) and originally reported on by ProPublica. Your goal is to recommend a model to predict the disposition ruled by the Civilian Complaint Review Board (CCRB) and identify key variables that appear to be associated with the board's ruling. 
+
+Please restrict your analysis to observations that were either "Substantiated" or "Exonerated", excluding observations that were "Unsubstantiated". This means that your models should predict whether the CCRB determined that the officer violated NYPD rules (yes = Substantiated, no = Exonerated), excluding cases where the CCRB could not conclude if the conduct occurred (Unsubstantiated). If you choose to incorporate information on officer rank and command, you will most likely want to collapse or otherwise simplify the categories for these variables (see the Rank Abbrevs and Command Abbrevs tabs in `CCRB Data Layout Table.xlsx`). If you do so, please briefly justify your reasoning. 
+
+
+```{r include=FALSE}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(pROC)
+library(reshape2)
+df <- read_csv("allegations_202007271729.csv")
+```
+
+```{r}
+######***ANALYSIS PLAN***######
+##GOAL: Recommend a model to predict the disposition ruled by the Civilian Complaint Review Board (CCRB) and identify key variables that appear to be associated with the board's ruling.
+
+##POSSIBLE COVARIATES: 
+  ##Mos demographic: mos_ethnicity, mos_gender, mos_age_incident
+  ##Complainant demographic: complainant_ethnicity, complainant_gender, complainant_age_incident
+  ##Complaint: fado_type, allegation
+  ##month_received, year_received
+  ##command_at_incident, rank_incident, precinct
+  
+##PURPOSE OF THE VIRTUALIZATION: distribution of outcomes, exploring relationships between variables, and identifying patterns 
+
+#Table 1. Characteristics summary across the disposition
+
+```
+
+
+```{r}
+# to do list 
+# 0. do exclusion first -- "restrict your analysis to observations that were either "Substantiated" or "Exonerated", excluding observations that were "Unsubstantiated
+# 1. data cleaning and write down notes about why 
+  # 1.1. exclude missing rows or combines missing as unknown categories 
+  # 1.2. merge categories or derive new variables if needed 
+# 4. make 4-10 plots/tables about data 
+# 5. Build any 2 machine learning models that use your choice of covariates to predict the given outcome variable.
+# 6. Explain why you chose those covariates and interpret the model performances. 
+# 7. Make recommendations for a non-technical audience./ your models should predict whether the CCRB determined that the officer violated NYPD rules 
+```
+
+# Part I: Data cleaning
+## Outcome:
+```{r}
+# Excluding observations that were "Unsubstantiated"
+df1 <- df %>% filter(!board_disposition %in% c("Unsubstantiated"))
+
+# Derive Outcome Variable: Exonerated = 0; Substantiated = 1
+table(df1$board_disposition, useNA = "ifany")
+
+df1$outcome <- 1
+df1$outcome[df1$board_disposition == "Exonerated"] <- 0
+table(df1$outcome)
+```
+
+## Covariates:
+### Exclude covariates that will not be used: 
+```{r}
+df2 <- df1 %>% select(-c(first_name, last_name, 
+                         command_now, rank_abbrev_now, rank_now, 
+                         rank_abbrev_incident, 
+                         month_closed, year_closed, 
+                         board_disposition))
+
+#"first_name" + "last_name": not use the name of the officers
+#"command_now" + "rank_abbrev_now" + "rank_now": Variables contains 'now' was excluded. Since we will not the variable after the outcome to predict outcome 
+# "rank_abbrev_incident": We have another version of variable `rank_incident` which contains less categories. Less categories make sure each group have more people and the model will be more effeciency.
+# "month_closed" + "year_closed were excluded since these are variables after the outcome 
+# "board_disposition" was excluded since this is the source variable to derive outcome 
+```
+
+### Futher clean covariates: 
+#### complainant_ethnicity: refused + unknown into one group
+```{r}
+#combined missing, unknow, and refused 
+df2$complainant_ethnicity[df2$complainant_ethnicity == "Refused"] <- "Unknown"
+df2$complainant_ethnicity[is.na(df2$complainant_ethnicity)] <- "Unknown"
+table(df2$complainant_ethnicity)
+```
+
+#### complainant_gender: trans + nonconforming + missing into one group
+```{r}
+df2$complainant_gender[df2$complainant_gender %in% c("Not described", "Transwoman (MTF)", "Gender non-conforming", "Transman (FTM)" )] <- "Other"
+df2$complainant_gender[is.na(df2$complainant_gender)] <- "Other"
+```
+
+#### complainant_age_incident:-1; too many missing	--> may drop this variate since there is too many missing
+```{r}
+df2$complainant_age_incident[df2$complainant_age_incident <= 0] <- NA
+```
+
+#### command_at_incident --> 'cmd.category' based on Command Abbrevs sheet with combination of some groups with too little people
+```{r}
+library(readxl)
+cmd.abb <- readxl::read_xlsx("CCRB Data Layout Table.xlsx", sheet = "Command Abbrevs")
+
+#cmd.abb
+df2$command_at_incident.d <- NA
+df2$command_at_incident.d <- cmd.abb$`Command Name`[match(df2$command_at_incident, cmd.abb$Abbreviation)]
+
+data <- df2
+data$Category <- NA
+# Category 1: Precincts (Patrol Divisions)
+data$Category[grep("Precinct", data$command_at_incident.d )] <- "Precincts"
+
+# Category 2: Specialized Units/Divisions
+specialized_units <- c("Narcotics", "Detective", "Gang", "Intelligence", "Emergency Service", 
+                       "Strategic Response", "Transportation", "Counterterrorism", "Vice", "Arson")
+for (unit in specialized_units) {
+  data$Category[grep(unit, data$command_at_incident.d )] <- "Specialized Units/Divisions"
+}
+
+# Category 3: Bureau/Command Divisions
+bureau_units <- c("Internal Affairs Bureau", "Police Service Area", "Criminal Intelligence", 
+                  "Criminal Justice Bureau", "Patrol Borough", "Medical Division", "Staff Services")
+for (bureau in bureau_units) {
+  data$Category[grep(bureau, data$command_at_incident.d )] <- "Bureau/Command Divisions"
+}
+
+# Category 4: Miscellaneous/Other
+miscellaneous <- c("Training", "Administration", "Facilities", "Operations", "Records", "Support")
+for (misc in miscellaneous) {
+  data$Category[grep(misc, data$command_at_incident.d )] <- "Miscellaneous/Other"
+}
+
+data$cmd.category <- data$Category 
+data$cmd.category[is.na(data$cmd.category)] <- "Unknown"
+table(data$cmd.category)
+```
+
+#### rank_incident --> 'rank.cat' based on Rank Abbrevs sheet with combination of some groups with too little people
+```{r}
+data <- data %>%
+  mutate(rank.cat = case_when(
+    str_detect(rank_incident, "Police Officer") ~ "Entry-Level",  # Police Officer
+    str_detect(rank_incident, "Sergeant") ~ "Supervisory",        # Sergeant, Sergeant Special Assignment, Sergeant Detective Squad
+    str_detect(rank_incident, "Detective") ~ "Detective",         # Detective Grades 1-3, Detective Specialist
+    str_detect(rank_incident, "Lieutenant") ~ "Supervisory",      # Lieutenant, Lieutenant Special Assignment, Lieutenant Commander Detective
+    str_detect(rank_incident, "Captain") ~ "Supervisory",         # Captain
+    str_detect(rank_incident, "Chief") ~ "Supervisory",             # Chief roles
+    str_detect(rank_incident, "Surgeon") ~ "Specialized Roles",   # Surgeon, Chief Surgeon, Deputy Chief Surgeon
+    TRUE ~ "Other"
+  ))
+
+table(data$rank.cat)
+
+# Entry-Level: Police Officer
+# Supervisory: Sergeant, Lieutenant, Captain
+# Detective: Detective Grades 1-3, Detective Specialist, Sergeant Detective Squad
+# Executive: Chief roles (Chief of Department, Chief of Staff, etc.)
+# Specialized Roles: Special Assignment and Surgeon titles
+```
+
+#### allegation --> 'allegation.cat'  based on the common knowledge
+```{r}
+data <- data %>%
+  mutate(allegation.cat = case_when(
+    str_detect(allegation, "Arrest|Question|Detention|Search|Stop|Premises entered|Person Searched|Seizure of property") ~ "Police Actions",
+    str_detect(allegation, "Chokehold|Gun as club|Handcuffs too tight|Pepper spray|Flashlight as club|Gun Drawn|Gun fired|Physical force|Mace|Punch/Kick|Push/Shove") ~ "Use of Force",
+    str_detect(allegation, "Ethnicity|Race|Gender|Sexual orientation|Religion|Sex Miscon|Gay/Lesbian Slur|Sexist Remark|Sexual Humiliation|Gender Identity") ~ "Discrimination and Bias",
+    str_detect(allegation, "Curse|Nasty Words|Profane Gesture|Rude Gesture|Other- Discourtesy|Retaliatory arrest|Retaliatory summons") ~ "Misconduct",
+    str_detect(allegation, "Body Cavity Searches|Frisk|Flashlight as club|Forcible Removal to Hospital|Gun Drawn|Strip-searched") ~ "Searches and Seizures",
+    str_detect(allegation, "Threat of force|Threat of arrest|Threat of force|Threat to Property|Threat to damage/seize property") ~ "Threats and Intimidation",
+    str_detect(allegation, "Property damaged|Property Seized|Hit against inanimate object|Vehicle stop|Vehicle search") ~ "Property Damage",
+    str_detect(allegation, "Electronic device information deletion|Improper dissemination of medical info|Failed to Obtain Language Interpretation|Refusal to obtain medical treatment|Refusal to provide RTKA card") ~ "Health and Medical Issues",
+    TRUE ~ "Other"
+  ))
+
+table(data$allegation.cat, useNA="ifany")
+
+# Police Actions: Actions related to arrests, questioning, detention, and other procedural activities.
+# Use of Force: Physical actions or methods used by officers involving force, weapons, or restraints.
+# Discrimination and Bias: Racial, ethnic, gender, and other biased behaviors.
+# Misconduct: Includes verbal abuse, discourtesy, and violations of rules or conduct.
+# Searches and Seizures: Activities involving searches of individuals, premises, or vehicles, as well as property seizures.
+# Threats and Intimidation: Actions and language involving threats to individuals or property.
+# Property Damage: Destruction, damage, or inappropriate use of property.
+# Health and Medical Issues: Actions related to medical care, including refusals and improper practices.
+# Other: Miscellaneous or unclassified items.
+```
+
+#### precinct --> 'precinct_cat' based on the specific precint form NYPD websites
+```{r}
+#table(data$precinct)
+
+# https://www.nyc.gov/site/nypd/bureaus/patrol/precincts-landing.page
+
+data$precinct_cat[data$precinct %in% c(1,5,6,7,9,10,13,14,17,18,19,20,22,23,24,25,26,28,30,32,33,34)] <- "Manhattan"
+
+data$precinct_cat[data$precinct %in% c(40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 52)] <- "Bronx"
+
+data$precinct_cat[data$precinct %in% c(60, 61, 62, 63, 66, 67, 68, 69, 70, 71, 72, 73, 75, 76, 77, 78, 79, 81, 83, 84, 88, 90, 94)] <- "Brooklyn"
+
+data$precinct_cat[data$precinct %in% c(100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115)] <- "Queens"
+
+data$precinct_cat[data$precinct %in% c(120, 121, 122, 123)] <- "Staten Island"
+data$precinct_cat[is.na(data$precinct)] <- "Unknown"
+data$precinct_cat[data$precinct %in% c(0, 1000)] <- "Unknown"
+
+
+table(data$precinct_cat, useNA = "ifany") # The missing is since the precinct is missing 
+
+# Bronx      Brooklyn     Manhattan        Queens Staten Island       Unknown 
+```
+
+#### contact_reason --> 'contact_reason_cat' based on the common knowledge
+```{r}
+df.contact <- data.frame(table(data$contact_reason))
+write.csv(df.contact, "df_contact.csv")
+
+data <- data %>%
+  mutate(contact_reason_cat = case_when(
+    contact_reason %in% c("Aided case", "EDP aided case", "EDP Aided Cases", "Execution of arrest/bench warrant", 
+                    "Execution of search warrant", "Report of Crime Past/Present", "Report of other crime", 
+                    "Report-gun possession/shots fired", "Report-possession/sale of narcotics", "Victim Subject of Sex Crime",
+                    "PD suspected C/V of violation/crime - auto", "PD suspected C/V of violation/crime - bldg", 
+                    "PD suspected C/V of violation/crime - street", "PD suspected C/V of violation/crime - subway") ~ "Crime-Related Activities",
+    
+    contact_reason %in% c("C/V at PCT to file complaint of crime", "C/V at PCT to obtain information", "C/V at PCT to retrieve property", 
+                    "C/V intervened on behalf of/observed encounter w/3rd party", "C/V requested info from officer", 
+                    "C/V requested investigation of crime", "C/V telephoned PCT", "Complainant at Pct. to make a Cmpl/info", 
+                    "Telephone Call to Precinct/Command", "Summons/Complainant") ~ "Non-Crime Reports or Inquiries",
+    
+    contact_reason %in% c("Moving violation", "Other violation of VTL", "Parking violation", "Traffic accident", 
+                    "Traffic Incidents/Accident/Prk Violation", "Vehicle Stop and Check", "Transit checkpoint", 
+                    "PD auto checkpoint") ~ "Traffic and Parking Violations",
+    
+    contact_reason  %in% c("Dispute", "Demonstration/protest", "Demonstrations", "Report of Disturbance/Noise Complaint", 
+                    "Report-noise/disturbance", "Report-domestic dispute", "Report-dispute", "EDP Aided Cases") ~ "Disputes and Public Disturbances",
+    
+     contact_reason  %in% c("Assist ACS or other agency", "Complainant Witnessing Incident", "Patrol Encounter", 
+                    "Regulatory inspection", "Parade/special event", "No contact", "Others", "Other", 
+                    "Stop/Question/Frisk") ~ "Assistance and Public Service",
+    
+    TRUE ~ "Unknown"
+  ))
+
+table(data$contact_reason_cat, useNA = "ifany")
+```
+
+#### outcome_description --> 'outcome_desc.cat' based on the common knowledge
+```{r}
+# df.outcome <- data.frame(table(data$outcome_description))
+# write.csv(df.outcome, file = "df_outcome_desc.csv")
+data <- data %>%
+  mutate(outcome_desc.cat = case_when(
+    outcome_description %in% c("Arrest - assault (against a PO)", "Arrest - resisting arrest", "Assault/Arrested", 
+                    "Resisting Arrest/Arrested") ~ "Arrests for Violent/Physical Crimes",
+    
+    outcome_description %in% c("Arrest - disorderly conduct", "Arrest - harassment (against a PO)", "Arrest - OGA", 
+                    "Arrest on Other Charge", "Arrest - other violation/crime", "Obstruct-Govt-Admin/Arrested") ~ "Arrests for Non-Violent Crimes",
+    
+    outcome_description %in% c("Disorderly-Conduct/Arr/Summons", "Harassment/Arrested/Summons", "Summons - disorderly conduct", 
+                    "Summons - harassment (against a PO)", "Summons - OGA", "Summons - other violation/crime", 
+                    "Parking summons issued", "Moving violation summons issued", "Other VTL violation summons issued", 
+                    "Traffic Summons Claimed or Issued") ~ "Summonses (Non-Arrest Related)",
+    
+    outcome_description %in% c("Juvenile Report", "No arrest made or summons issued", "Other Summons Claimed or Issued") ~ "Juvenile and Other Reports",
+    
+    TRUE ~ "Unknown"
+  ))
+
+table(data$outcome_desc.cat)
+
+# Arrests for Violent/Physical Crimes: This category would include crimes related to violence or physical confrontation with law enforcement officers or others.
+# Arrests for Non-Violent Crimes: These are arrests related to non-violent offenses or non-compliance.
+# Summonses (Non-Arrest Related): This category includes summons issued for offenses that don't result in arrest but require official action, such as a ticket or citation.
+# Juvenile and Other Reports: This category would include reports related to juveniles or non-specific incidents where an arrest or summons is not involved.
+```
+
+## Extract variables to be used 
+```{r}
+df.cleaned <- data %>% select(-c(precinct, allegation, command_at_incident.d, Category, contact_reason, outcome_description, command_at_incident, rank_incident))
+
+names(df.cleaned)
+```
+
+*Data Pre-processing and Cleaning: Outcome Variable*
+*In the data cleaning stage of the project, we focused on observations where the board's decisions were clear, specifically those labeled as "Substantiated" or "Exonerated." To do this, we filtered out any cases marked as "Unsubstantiated." Next, we prepared the outcome variable by assigning a value of 0 to "Exonerated" cases and a value of 1 to "Substantiated" cases. This step created a straightforward binary variable that distinguishes between the two types of board decisions, setting the stage for our upcoming analysis.*#
+
+*Data Pre-processing and Cleaning: Covariates I*
+*In the initial phase of cleaning our covariates, we selected relevant variables by excluding those not necessary for our analysis. We removed personal identifiers such as `first_name` and `last_name` because they do not contribute to predicting the outcomes of the cases. Variables related to the current status of officers, such as `command_now`, `rank_abbrev_now`, and `rank_now`, were also excluded because our focus is on conditions at the time of the incident, not their present status.* 
+#*Additionally, we opted to use `rank_incident` over `rank_abbrev_incident` because it contains fewer categories, which simplifies our model and improves its efficiency by ensuring a larger sample size in each category. Variables indicating the time of case closure like `month_closed` and `year_closed` were removed as they occur after the outcome and could lead to data leakage, influencing the model with information that wouldn't be available at the time of prediction. Lastly, `board_disposition` was excluded as it was the basis for deriving our outcome variable, making it redundant for further modeling. *
+
+*Data Pre-processing and Cleaning: Covariates II*
+*In the further refinement of our dataset, we took several steps to clean and categorize the covariates, enhancing the clarity and usability of our data for predictive modeling. We consolidated entries marked as "Refused" and any missing values into the "Unknown" category for complainant ethnicity to address data sparsity. For complainant gender, smaller categories like "Transwoman (MTF)", "Gender non-conforming", "Transman (FTM)", and missing entries were grouped into "Other." We set non-positive and missing age values to `NA` to maintain the integrity of the complainant age data. Using Command Abbreviations from the codebook, we categorized the `command_at_incident` variable by matching commands to broader categories. The `rank_incident` was further categorized into "Entry-Level", "Supervisory", "Detective", and "Specialized Roles" based on rank abbreviations to aid in understanding rank impacts on outcomes. Allegations were grouped into categories such as "Police Actions", "Use of Force", and "Discrimination and Bias" based on their nature, while precincts were grouped by geographical location in NYC from the NYPD website (e.g., "Manhattan", "Bronx", "Brooklyn"). Lastly, we categorized `contact_reason` into groups like "Crime-Related Activities", "Traffic and Parking Violations", and "Disputes and Public Disturbances" to provide deeper insights into the contexts of police interactions. *
+
+
+# Part II: Data Visualization
+## Table
+### Table 1: Descriptive
+```{r warning=FALSE}
+
+table1_list <- c(
+  "month_received", "year_received", 
+  "mos_ethnicity", "mos_gender", "mos_age_incident",  
+  "cmd.category", "rank.cat",
+  "complainant_ethnicity", "complainant_gender", "complainant_age_incident",
+  "fado_type",  "allegation.cat", "precinct_cat", "contact_reason_cat", "outcome_desc.cat"
+)
+cat_var <- c(
+  "month_received", "year_received", 
+  "mos_ethnicity", "mos_gender",
+  "complainant_ethnicity", "complainant_gender",
+  "fado_type", "cmd.category", "rank.cat", "allegation.cat", "precinct_cat", "contact_reason_cat", "outcome_desc.cat"
+)
+df.cleaned
+df.cleaned[cat_var] <- lapply(df.cleaned[cat_var], as.factor)
+
+#month_received
+table1::label(df.cleaned$month_received) <- "Month receive the complaint"
+#year_received
+table1::label(df.cleaned$year_received) <- "Year receive the complaint"
+#mos_ethnicity
+table1::label(df.cleaned$mos_ethnicity) <- "Ethnicity (Mos)"
+#mos_gender
+# df.cleaned$mos_gender <- factor(
+#   df.cleaned$mos_gender, 
+#   level = c("F", "M"),
+#   labels = c("Female", "Male")
+# )
+df.cleaned$mos_gender <- ifelse(df.cleaned$mos_gender == "M", "Male", "Female")
+table1::label(df.cleaned$mos_gender) <- "Gender (Mos)"
+#mos_age_incident
+table1::label(df.cleaned$mos_age_incident) <- "Age ate incident (Mos)"
+#cmd.category
+table1::label(df.cleaned$cmd.category) <- "Officer's command at the incident"
+#rank.cat
+table1::label(df.cleaned$rank.cat) <- "Officer's rank at the incident"
+#complainant_ethnicity
+table1::label(df.cleaned$complainant_ethnicity) <- "Ethnicity (Complainant)"
+#complainant_gender
+table1::label(df.cleaned$complainant_gender) <- "Gender (Complainant)"
+#complainant_age_incident
+table1::label(df.cleaned$complainant_age_incident) <- "Age ate incident (Complainant)"
+#fado_type
+table1::label(df.cleaned$fado_type) <- "Top-level category of complaint"
+#allegation.cat
+table1::label(df.cleaned$allegation.cat) <- "Specific category of complaint"
+#precinct_cat
+table1::label(df.cleaned$precinct_cat) <- "Precinct of the complaint"
+#contact_reason_cat
+table1::label(df.cleaned$contact_reason_cat) <- "Reason of the complaint"
+#outcome_desc.cat
+table1::label(df.cleaned$outcome_desc.cat) <- "Outcome of the complaint contact"
+#outcome
+df.cleaned$outcome <- factor(
+  df.cleaned$outcome, 
+  levels = c(0, 1), 
+  labels = c("Exonerated", "Substantiated")
+)
+table1::label(df.cleaned$outcome) <- "Outcome of the complaint contact"
+
+table1::table1(
+  as.formula(paste("~", paste(table1_list, collapse = "+"), "| outcome")),
+  data = df.cleaned
+)
+
+```
+
+```{r}
+df.cleaned$outcome <- as.character(df.cleaned$outcome)
+df.cleaned$outcome[df.cleaned$outcome == "Substantiated"] = 1
+df.cleaned$outcome[df.cleaned$outcome == "Exonerated"] = 0
+df.cleaned$year_received <- as.numeric(as.character(df.cleaned$year_received))
+df.cleaned$year_month <- paste0(df.cleaned$year_received, "-", sprintf("%02d", df.cleaned$month_received))
+df.cleaned <- df.cleaned %>%
+  mutate(year_month = as.Date(paste0(year_month, "-01"), format = "%Y-%m-%d")) 
+```
+
+## Figure: Data Visualization
+### Figure 1: Stacked Bar Plot - Distribution of Outcomes by Complainant Age
+```{r warning=FALSE}
+plot.complainant_age_incident <- df.cleaned %>%
+  ggplot(
+  aes(x = complainant_age_incident, fill = factor(outcome))) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 30, color = "black") +
+  labs(title = "Distribution of outcome by complaints Age",
+       x = "Complainant Age at Incident",
+       y = "Count of Outcomes",
+       fill = "Outcome") +
+  theme_minimal() +
+  scale_fill_manual(values = c("red", "blue") ,
+                      labels = c("0" = "Exonerated", "1" = "Substantiated")
+        ) + 
+  scale_x_continuous(breaks = seq(0, max(df.cleaned$complainant_age_incident, na.rm = T), by = 5))
+plot.complainant_age_incident
+```
+
+*Based on the plot showing the distribution of outcomes by complainant age, it's clear that age does not significantly differentiate between "Substantiated" and "Not Substantiated" outcomes, as both categories are uniformly distributed across all age groups. This overlap indicates that age alone lacks discriminatory power to predict the disposition ruled by the CCRB.*
+
+
+### Figure 2: Time Series Line Plot - Trends of CCRB Complaint Outcomes by Command Categories Over Complaint Received Time
+```{r}
+df.plot.cmd.category <- df.cleaned %>% 
+  group_by(cmd.category, outcome, year_received) %>% 
+  summarize(Count = n(), .groups = "drop")
+
+plot.cmd.category <- df.plot.cmd.category %>%
+  ggplot(
+    aes(x = year_received, y = Count, color = cmd.category, linetype = factor(outcome, labels = c("0" = "Exonerated", "1" = "Substantiated")))) +
+  theme_minimal() +
+  geom_line(size = 0.4) + 
+  geom_point(size = 0.1) + 
+  labs(title = "Trends of CCRB Complaint Outcomes by Command Categories Over Complaint Received Time",
+       x = "Year the Complaint was Received by CCRB", 
+       y = "Count of Outcomes", 
+       color = "Command at Incident", 
+       linetype = "Outcome") + 
+   scale_x_continuous(breaks = seq(0, max(df.plot.cmd.category$year_received, na.rm = T), by = 5))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6))
+plot.cmd.category
+```
+
+*Based on the plot showing the complaint outcomes by command categories over time, it suggests significant variations and overlaps in complaint outcomes across different command categories, indicating that Command at Incident may not serve as a reliable predictor for the CCRB dispositions. The inconsistencies across time and the overlapping trends for substantiated and not substantiated outcomes across commands suggest that the command at incident alone does not decisively influence the likelihood of a complaint being substantiated. *
+
+
+### Figure 3: Time Series Line Plot - Trends of Outcomes Over Complaint Received Time
+```{r}
+Figure1 <- df.cleaned %>%
+group_by(year_month, outcome) %>%
+summarise(count = n()) %>%
+ungroup()
+
+Figure1$year_month <- as.Date(paste0(Figure1$year_month, "-01"))
+
+ggplot(Figure1, aes(x = year_month, y = count, color = as.factor(outcome))) +
+  geom_line(size = 0.4) +
+  labs(title = "Trends of Outcomes Over Complaint Received Time",
+       x = "Year the Complaint was Received by CCRB",
+       y = "Count of Outcomes",
+       color = "Outcome") +
+  scale_x_date(date_labels = "%Y",
+               date_breaks = "1 year") +
+  scale_color_manual(values = c("0" = "red", "1" = "blue"),
+                     labels = c("0" = "Exonerated", "1" = "Substantiated")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 65, hjust = 1))
+```
+
+*From this plot, we can find a significant association between the complaint outcomes (Not Substantiated and Substantiated) and the year the complaint was received. Over time, starting from the early 2000s, the counts of substantiated and exonerated outcomes both increased noticeably, indicating a general rise in complaints being reviewed. There is also a distinct trend that while substantiated complaints showed sharper spikes around certain periods (e.g., 2014–2018), exonerated outcomes remained consistently lower but fluctuated, which may indicate that external factors might have influenced the rate of substantiated complaints relative to exonerated ones.*
+
+
+### Figure 4: Grouped Bar Plot - Distribution of Outcomes by Complaint Received Time and FADO Type
+```{r}
+Figure2 <- df.cleaned %>%
+  group_by(
+    three_year_group = cut(as.numeric(format(as.Date(paste0(year_month, "-01")), "%Y")),
+                           breaks = seq(1985, 2021, by = 3),
+                           labels = paste0(seq(1985, 2018, by = 3), "-", seq(1987, 2020, by = 3)),
+                           include.lowest = TRUE),
+    fado_type,
+    outcome) %>% summarise(count = n(), .groups = "drop")
+
+ggplot(Figure2, aes(x = three_year_group, y = count, fill = as.factor(outcome))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_grid(~fado_type) +
+  labs(title = "Distribution of Outcomes by Complaint Received Time and FADO Type",
+       x = "Time the Complaint was Received by CCRB",
+       y = "Count of Outcomes",
+       fill = "Outcome") +
+  scale_fill_manual(values = c("0" = "red", "1" = "blue"),
+                    labels = c("0" = "Exonerated", "1" = "Substantiated")) +
+  scale_y_log10() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 5))
+```
+
+*The plot suggest a significant association between the outcome (substantiated vs. exonerated), FADO type, and time. In the bar plot, we see that certain FADO types, such as Force and Abuse of Authority, consistently have higher counts of complaints but show distinct differences in outcomes. For example, Force complaints are more likely to result in "Exonerated" outcomes, while Offensive Language complaints almost exclusively lead to "Substantiated" outcomes. This pattern indicates that the type of complaint strongly influences the likelihood of substantiation. Additionally, the trends over time show that the number of complaints has increased, particularly for "Abuse of Authority" and "Force". While time plays a role in overall complaint volume, the association between outcomes and FADO type remains clear and consistent, showing that some complaint categories are more likely to be substantiated than others.*
+
+
+### Figure 5: Faceted Line Graph - Trends of Outcomes Over Complaint Received Time by Precinct Category (exclude unknown precincts)
+```{r}
+Figure3 <- df.cleaned %>%
+  filter(precinct_cat != "Unknown") %>%
+  group_by(year_received, precinct_cat, outcome) %>%
+  summarise(count = n(), .groups = "drop")
+
+ggplot(Figure3, aes(x = year_received, y = count, color = as.factor(outcome), group = outcome)) +
+  geom_line(size = 0.4) +
+  facet_wrap(~precinct_cat, scales = "free_y") +
+  labs(title = "Trends of Outcomes Over Complaint Received Time by Precinct Category",
+       x = "Year the Complaint was Received by CCRB",
+       y = "Count of Outcomes",
+       color = "Outcome") +
+  scale_color_manual(values = c("0" = "red", "1" = "blue"),
+                     labels = c("0" = "Exonerated", "1" = "Substantiated")) +
+  scale_x_continuous(breaks = seq(1985, 2021, by = 5),
+                     expand = c(0, 0)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+```
+
+*This plot shows a significant association between the outcomes (substantiated and exonerated) and the precinct category over time. In all precincts (Bronx, Brooklyn, Manhattan, Queens, and Staten Island), the counts of both outcomes increased noticeably starting around the early 2000s, indicating a general rise in complaints. However, the trends differ across precincts. For instance, in Brooklyn and Bronx, exonerated outcomes consistently exceed substantiated ones over most years, while in Manhattan, Queens, and Staten Island, the trends are more balanced, with substantiated outcomes occasionally surpassing the exonerated ones. The consistent increase in complaints, especially post-2000, highlights a temporal association, suggesting that precinct-specific factors may influence the likelihood of outcomes being substantiated or not. The variability across precincts highlights that the precinct category plays a role in shaping the trends of complaint outcomes, indicating a significant association.*
+
+
+### Figure 6: Time Series Line Plot - Outcomes by FADO Type Over Time
+```{r}
+df.cleaned %>%
+  group_by(year_received, fado_type, outcome) %>%
+  summarise(count = n(), .groups = "drop") %>% 
+  ggplot(aes(x = year_received, y = count, color = fado_type, linetype =
+                        as.factor(outcome))) +
+  geom_line(size = 1) +  
+  labs(
+    title = "Outcomes by FADO Type Over Time",
+    x = "Year the Complaint was Received by CCRB",
+    y = "Count of Outcomes",
+    color = "FADO Type",
+    linetype = "Outcome"
+  ) +
+  scale_color_brewer(palette = "Dark2") +  
+  scale_linetype_manual(
+    values = c("0" = "dashed", "1" = "solid"),
+    labels = c("0" = "Exonerated", "1" = "Substantiated")
+  ) +
+  theme_minimal() 
+```
+
+*Based on the plot, the number of complaints increases over time. The trend of the outcome by FADO type remains the same over time. The FADO type "Force" and "Discourtesy" have an imbalance count of the outcome. Force is more likely to be not substantiated. Discourtesy is more likely to be substantiated.*
+
+
+### Figure 7: Time Series Line Plot - Outcomes by Allegation Cat Over Time
+```{r}
+df.cleaned %>%
+  group_by(year_received, allegation.cat, outcome) %>%
+  summarise(count = n(), .groups = "drop") %>% 
+  ggplot(aes(x = year_received, y = count, color = allegation.cat, linetype =
+                        as.factor(outcome))) +
+  geom_line(size = 1) +  
+  labs(
+    title = "Outcomes by Allegation Category Over Time",
+    x = "Year the Complaint was Received by CCRB",
+    y = "Count of Outcomes",
+    color = "Allegation Category",
+    linetype = "Outcome"
+  ) +
+  scale_color_brewer(palette = "Dark2") +  
+  scale_linetype_manual(
+    values = c("0" = "dashed", "1" = "solid"),
+    labels = c("0" = "Exonerated", "1" = "Substantiated")
+  ) +
+  theme_minimal() 
+```
+
+*Based on the plot, the number of complaints increases over time, with a peak around 2005–2010 and a sharp rise in "Other" allegations after 2015. The trend of the outcome by allegation category remains consistent over time. The allegation category "Use of Force" is more likely to be not substantiated, while "Other" shows a significant imbalance with most outcomes also being not substantiated. Categories like "Misconduct" and "Searches and Seizures" also have a majority of outcomes as not substantiated.*
+
+
+### Figure 8: Stacked Bar Plot - Distribution of Outcomes by Contact Reason, Complainant Ethnicity, and Outcome
+```{r}
+reason_ethnicity <- df.cleaned %>%
+  group_by(contact_reason_cat, complainant_ethnicity, outcome) %>% # group contact reason to figure out association
+  summarise(count = n(), .groups = "drop")
+
+# Plot the chart
+ggplot(reason_ethnicity, aes(x = contact_reason_cat, y = count, fill = complainant_ethnicity)) + # add in relative x and y axis
+  geom_bar(stat = "identity", position = "stack") +  # Stacked bars
+  facet_wrap(~outcome, ncol = 2, labeller = as_labeller(c("0" = "Exonerated", "1" = "Substantiated"))) +
+  labs(
+    title = "Distribution of Complaints by Contact Reason and Ethnicity",
+    x = "Contact Reason Category",
+    y = "Count of Complaints",
+    fill = "Complainant Ethnicity"
+  ) +
+  scale_fill_brewer(palette = "Set3") +
+    scale_fill_manual(    # adjust the color scheme for different ethnicity groups to match with the overall color pattern
+    values = c(
+      "American Indian" = "#8DD3C7",  
+      "Asian" = "#FFFFB3",           
+      "Black" = "#BEBADA",           
+      "Hispanic" = "#FB8072",       
+      "Other Race" = "#80B1D3",      
+      "Unknown" = "#FDB462",         
+      "White" = "#B3DE69"            
+    )
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 5))
+
+
+```
+
+*The chart reveals a significant association between contact reasons and ethnicity, particularly in the Crime-Related Activities category. Black complainants are heavily overrepresented in this category, with significantly higher complaint volumes compared to other ethnic groups. This strong association suggests systemic policing patterns, where Black individuals experience a higher frequency of police interactions, particularly in crime-related contexts. Complaints from other ethnicities are more evenly distributed across categories but remain far lower in comparison.*
+
+
+### Figure 9: Time Series Line Plot - Trends of Outcomes by Complainant Ethnicity Over Time
+```{r}
+ethnicity_year <- df.cleaned %>%
+  group_by(year_received, complainant_ethnicity, outcome) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Plot all covariates in 1 chart
+ggplot(ethnicity_year, aes(x = year_received, y = count, color = complainant_ethnicity, linetype = as.factor(outcome))) +
+  geom_line(size = 1) +  
+  labs(
+    title = "Outcomes Over Complaint by Complainant Ethnicity Over Time",
+    x = "Year the Complaint was Received by CCRB",
+    y = "Count of Outcomes",
+    color = "Ethnicity",
+    linetype = "Outcome"
+  ) +
+  scale_color_manual(         # adjust the color scheme for different ethnicity groups to match with the overall color pattern
+    values = c(
+      "American Indian" = "#8DD3C7",  
+      "Asian" = "#FFFFB3",           
+      "Black" = "#BEBADA",           
+      "Hispanic" = "#FB8072",       
+      "Other Race" = "#80B1D3",      
+      "Unknown" = "#FDB462",         
+      "White" = "#B3DE69"            
+    )
+  ) +
+  scale_linetype_manual(
+    values = c("0" = "dotted", "1" = "solid"),
+    labels = c("0" = "Exonerated", "1" = "Substantiated")
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 5))
+```
+
+*This time-series chart demonstrates a significant association between ethnicity and the outcome of complaints over time. Complaints from Black complainants have increased sharply since the early 2000s, far surpassing those from other ethnic groups. The association is particularly evident in the prevalence of Not Substantiated outcomes, which consistently outnumber Substantiated outcomes. For other ethnic groups, such as Hispanic, Asian, and White complainants, complaints remain lower but show a similar pattern where Substantiated outcomes are less frequent. This suggests systemic challenges in validating complaints across ethnic groups, especially for Black individuals. *
+
+
+### Figure 10: Stacked Bar Plot - Distribution of Outcomes by Officers' Gender
+```{r}
+stacked_bar_chart <- ggplot(df.cleaned, aes(x = mos_gender, fill = factor(outcome))) +
+  geom_bar(position = "fill") +
+  labs(title = "Stacked Distribution of Outcome by Officers' Gender",
+       x = "Gender",
+       y = "Proportion",
+       fill = "Outcome") +
+  scale_fill_manual(values = c("0" = "red", "1" = "blue"),
+                    labels = c("0" = "Exonerated", "1" = "Substantiated")) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal()
+
+print(stacked_bar_chart)
+```
+
+*This plot normalizes the data into proportions, reveals an important insight. For females, a higher proportion of outcomes are unsubstantiated, while for males, the proportion of "Exonerated" cases is relatively higher. This suggests that gender could influence the likelihood of outcomes, either due to inherent systemic biases, gendered patterns in accusations, or other sociocultural dynamics. In conclusion, the observed trends suggest that gender plays a role in predicting outcomes such as "Unsubstantiated" and "Exonerated."*
+
+
+# Part III: Machine Learning Model
+
+
+```{r}
+ml_data <- df.cleaned
+ml_data <- na.omit(ml_data)
+ml_data$outcome <- as.factor(ml_data$outcome)
+
+# Split the data into training and testing sets
+set.seed(123)  # For reproducibility
+trainIndex <- createDataPartition(ml_data$outcome, p = 0.8, list = FALSE)
+trainData <- ml_data[trainIndex, ]
+testData <- ml_data[-trainIndex, ]
+```
+
+*For the machine learning model, the covariates included in the model were chosen to capture critical dimensions influencing the outcomes. Temporal variables, such as month_received and year_received, provide insight into potential seasonal or annual trends in complaint handling, reflecting changes in policies or public scrutiny. The fado_type and allegation.cat variables represent the broader and specific categories of complaints, highlighting how the nature and severity of allegations impact substantiation likelihood. precinct_cat captures geographical and organizational context, recognizing that local factors or precinct-level practices may influence outcomes. Demographic variables, such as mos_gender (officer's gender) and complainant_ethnicity (complainant's ethnicity), allow for the exploration of potential biases or behavioral patterns in interactions and outcomes. Finally, outcome_desc.cat reflects the detailed disposition of cases, helping to understand how specific types of resolutions relate to substantiation probabilities. Together, these variables provide a comprehensive framework for analyzing the determinants of rulings.*
+
+
+## Logistic Regression Model
+
+```{r}
+# GLM Model 
+glm_model <- glm(outcome ~ month_received + year_received + fado_type + precinct_cat+ allegation.cat + mos_gender +
+                    complainant_ethnicity + outcome_desc.cat, 
+                 family = binomial(link = "logit"), 
+                 data = trainData)
+
+# Summary of the GLM model
+summary(glm_model)
+
+# Predict on test data
+glm_pred <- predict(glm_model, newdata = testData, type = "response")
+glm_pred_class <- ifelse(glm_pred > 0.5, 1, 0)
+
+# Evaluate GLM model
+confusionMatrix(as.factor(glm_pred_class), as.factor(testData$outcome))
+
+# ROC and AUC for GLM
+roc_glm <- roc(testData$outcome, glm_pred)
+auc(roc_glm)
+```
+
+
+## Random Forest Model
+
+```{r}
+# Random Forest Model
+rf_model <- randomForest(outcome ~ month_received + year_received + fado_type + precinct_cat+ allegation.cat +
+                           mos_gender + complainant_ethnicity + outcome_desc.cat, 
+                         data = trainData, ntree = 500, importance = TRUE)
+```
+
+
+```{r}
+# Summary of the Random Forest model
+print(rf_model)
+summary(rf_model)
+
+# Extract variable importance from the Random Forest model
+importance_df <- as.data.frame(importance(rf_model))
+importance_df$Variable <- rownames(importance_df)  # Add variable names as a column
+
+# Sort the data by Mean Decrease Accuracy
+importance_df <- importance_df[order(importance_df$MeanDecreaseAccuracy, decreasing = TRUE), ]
+
+# Create a named vector for the updated labels
+variable_labels <- c(
+  "month_received" = "Month the complaint was received by CCRB",
+  "year_received" = "Year the complaint was received by CCRB",
+  "outcome_desc.cat" = "Outcome of the contact between office and complainant",
+  "allegation.cat" = "Specific category of complaint",
+  "fado_type" = "Top-level category of complaint",
+  "precinct_cat" = "Precinct with the complaint",
+  "complainant_ethnicity" = "Complainant's ethnicity",
+  "mos_gender" = "Officer's gender"
+)
+
+# Replace variable names with labels in the data frame
+importance_df$Variable <- variable_labels[importance_df$Variable]
+
+# Recreate the bar plot with updated y-axis labels
+ggplot(importance_df, aes(x = reorder(Variable, MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  coord_flip() +  # Flip for horizontal bars
+  theme_minimal(base_size = 14) +
+  labs(title = "Variable Importance",
+       x = "Variables",
+       y = "Mean Decrease Accuracy")
+```
+
+
+```{r}
+# Predict probabilities and classes on test data
+rf_pred_prob <- predict(rf_model, newdata = testData, type = "prob")[, 2]
+rf_pred_class <- predict(rf_model, newdata = testData)
+
+# Evaluate Random Forest model
+confusionMatrix(as.factor(rf_pred_class), testData$outcome)
+
+# ROC and AUC for RF
+roc_rf <- roc(as.numeric(testData$outcome) - 1, rf_pred_prob)  # Convert factor to numeric for ROC
+auc(roc_rf)
+```
+
+
+## Compare Logistic Regression Model and Random Forest Model
+
+```{r}
+# Plot ROC curves
+# Assess classification performance
+ggplot() +
+  geom_line(data = data.frame(specificities = 1 - roc_glm$specificities, sensitivities = roc_glm$sensitivities), 
+            aes(x = specificities, y = sensitivities), color = "blue") +
+  geom_line(data = data.frame(specificities = 1 - roc_rf$specificities, sensitivities = roc_rf$sensitivities), 
+            aes(x = specificities, y = sensitivities), color = "red") +
+  geom_abline(linetype = "dashed", color = "black") +
+  labs(title = "ROC Curves for GLM and Random Forest", x = "1 - Specificity", y = "Sensitivity") +
+  theme_minimal() +
+  scale_color_manual(name = "Model", values = c("blue" = "GLM", "red" = "RF"))
+```
+
+
+```{r}
+# Calculate AUC for GLM
+auc_glm <- auc(roc_glm)
+cat("AUC for Logistic Regression (GLM):", round(auc_glm, 4), "\n")
+
+# Calculate AUC for Random Forest
+auc_rf <- auc(roc_rf)
+cat("AUC for Random Forest:", round(auc_rf, 4), "\n")
+``` 
+
+
+*Comparing the logistics regression model and the random forest model, the random forest has a higher accuracy(0.7556), sensitivity(0.7751), and specificity(0.7339) than the regression model (0.7141, 0.7457, 0.6792). This means that the random forest has a better ability to predict the true outcome. Furthermore, the AUC score also shows that the random forest model has a better performance (0.8302 > 0.7854).*
+
+# Part IV: The company stakeholders want to know what decision they should make on their stated goal/question. Based on your analysis, make recommendations for a non-technical audience.
+The most influential factor for the disposition ruled by the CCRB is the year the complaint was received, with complaints filed in recent years, particularly after 2015, being more likely to be substantiated. This trend reflects not just improvements in investigative processes but also increased public awareness of laws and regulations, as well as heightened societal attention to police accountability. Therefore, enhancing the legal awareness of law enforcement officers through continuous education and training is crucial to ensure they keep pace with evolving laws and societal expectations, thereby improving accountability and the substantiation of complaints over time.
+The outcome of the contact between the officer and complainant description category further plays an important role in disposition. To be specific, serious incidents, such as violent arrests or physical confrontations, are more likely to be substantiated. To improve the handling of serious incidents such as violent arrests or physical confrontations, stakeholders should implement more rigorous and comprehensive de-escalation training for officers, ensuring they are equipped with effective conflict resolution skills to prevent such incidents from escalating.
+Both the specific nature of the allegation and its classification under Force, Abuse of authority, Discourtesy, or Offensive language (FADO) are highly predictive of outcomes. The CCRB should prioritize regular reviews and updates to the policies governing these categories, ensuring clear guidelines and accountability measures are in place to handle such complaints effectively.
+Given the observed geographic patterns where certain precincts, such as those in Brooklyn, experience higher substantiation rates, it is recommended that the NYPD conduct targeted audits and enhanced training initiatives in these areas to address specific local issues and ensure consistent application of policies across all precincts.
+The ethnicity of complainants and the gender of the officer involved also influence complaint outcomes. Higher substantiation rates among complaints are from Black and Hispanic individuals and against male officers. While this may reflect systemic patterns, it is essential to monitor these trends to ensure fairness and transparency in complaint investigations.
+
+# Part V: Any additional information that might be useful to collect/have? Other open-ended/non-coding question(s)?
+To improve the analysis and outcome prediction, it would be better to divide the focus into three distinct parts: information about the officers, the complaints, and the public's perception.
+Officer Perception: Incorporating officer tenure, measured as the number of years an officer has served in the NYPD, could provide insights into whether experience or time on the force influences the likelihood of complaints being substantiated. Analyzing an officer's complaint history, including the total number of prior complaints and how many were substantiated, can help identify officers with recurring issues and inform targeted interventions. Understanding the type of evidence presented during the CCRB review processsuch as video footage, photographs, or other physical evidence could reveal its impact on complaint outcomes. 
+Complaint Perception: Examining patterns of repeat complainants, specifically whether individuals have filed multiple complaints against the police in the past, could highlight unresolved tensions within certain communities or raise credibility concerns. 
+Public Perception: The information on public response to the incident collected through surveys, could provide valuable insights into public trust and the overall effectiveness of the CCRB's processes.
+
+
